@@ -40,8 +40,9 @@ resource "kubernetes_secret_v1" "tfe_pull_secret" {
 }
 
 locals {
-  route_name   = "tfe"
-  tfe_hostname = "${local.route_name}-${var.namespace}.${data.ibm_container_vpc_cluster.cluster.ingress_hostname}" # Compute the TFE hostname based on the namespace and cluster ingress hostname. Not putting a dependency on the route resource here, as it is created after the helm release.
+  tfe_deployment_replicas = var.tfe_deployment_replicas != null ? var.tfe_deployment_replicas : 3
+  route_name              = "tfe"
+  tfe_hostname            = "${local.route_name}-${var.namespace}.${data.ibm_container_vpc_cluster.cluster.ingress_hostname}" # Compute the TFE hostname based on the namespace and cluster ingress hostname. Not putting a dependency on the route resource here, as it is created after the helm release.
 
   # building the list of values to configure in the helm release
   set_values_list = [
@@ -168,6 +169,14 @@ locals {
     {
       name  = "serviceAccount.name"
       value = "tfe"
+    },
+    {
+      name  = "replicaCount"
+      value = local.tfe_deployment_replicas
+    },
+    {
+      name  = "tfe.readinessProbePath"
+      value = "/_health_check"
     }
   ]
 
@@ -197,7 +206,12 @@ locals {
       name  = "tlsSecondary.certificateSecret"
       value = var.tfe_secondary_hostname_secret_name
     }
-  ] : []
+    ] : [
+    {
+      name  = "tlsSecondary"
+      value = null
+    }
+  ]
 
   # concatenating values for the final list
   set_values_list_final = concat(local.set_values_list, local.set_values_list_secondary_hostname)
@@ -230,7 +244,7 @@ locals {
     },
     {
       name  = "env.variables.TFE_RUN_PIPELINE_KUBERNETES_POD_TEMPLATE"
-      value = "eyJzZWN1cml0eUNvbnRleHQiOnsiYWxsb3dQcml2aWxlZ2VFc2NhbGF0aW9uIjpmYWxzZSwiY2FwYWJpbGl0aWVzIjp7ImRyb3AiOlsiQUxMIl19LCJydW5Bc05vblJvb3QiOnRydWUsInNlY2NvbXBQcm9maWxlIjp7InR5cGUiOiJSdW50aW1lRGVmYXVsdCJ9fX0=" # pragma: allowlist secret
+      value = base64encode(var.tfe_pod_template_security_config)
     },
     {
       name  = "env.secrets.TFE_IACT_TOKEN"
@@ -253,11 +267,61 @@ locals {
   set_sensitive_values_list_final = concat(local.set_sensitive_values_list, local.set_sensitive_values_list_secondary_hostname)
 }
 
+resource "kubernetes_config_map" "custom_tfe_start" {
+  metadata {
+    name      = "custom-tfe-start"
+    namespace = kubernetes_namespace_v1.tfe.metadata[0].name
+  }
+
+  data = {
+    "custom_tfe_start.sh" = file("${path.module}/scripts/custom_tfe_start.sh")
+  }
+}
+
+locals {
+  tfe_deployment_labels      = {}
+  tfe_deployment_annotations = {}
+
+  tfe_service_values = {
+    "annotations" : {
+      "service.beta.openshift.io/serving-cert-secret-name" : "terraform-enterprise-certificates",
+    },
+    "labels" : {},
+    "type" : var.tfe_service_servicetype,
+    "adminNodePort" : var.tfe_service_admin_node_port,
+  }
+
+  tfe_service_account = {}
+
+  tfe_secret = {}
+
+  tfe_agents_rbac = {}
+
+  tfe_secondary_hostname_secret_name = var.tfe_secondary_hostname_secret_name != null && var.tfe_secondary_hostname_secret_name != "" ? var.tfe_secondary_hostname_secret_name : "terraform-enterprise-certificates-secondary"
+
+  tfe_service_secondary_values = var.tfe_secondary_hostname_fqdn != null ? {
+    "annotations" : {
+      "service.beta.openshift.io/serving-cert-secret-name" : "${local.tfe_secondary_hostname_secret_name}-internal",
+    },
+    "labels" : {},
+    "type" : var.tfe_service_secondary_servicetype,
+    "adminNodePort" : var.tfe_service_secondary_admin_node_port,
+  } : null
+
+  tfe_resources_configuration = {
+    "requests" : {
+      "memory" : var.tfe_resources_configuration_memory != null && var.tfe_resources_configuration_memory != "" ? var.tfe_resources_configuration_memory : "3000Mi",
+      "cpu" : var.tfe_resources_configuration_cpu != null && var.tfe_resources_configuration_cpu != "" ? var.tfe_resources_configuration_cpu : "1",
+    }
+  }
+}
+
 # ########################################################################################################################
 # # Terraform Enterprise Helm Chart
 # ########################################################################################################################
 
 resource "helm_release" "tfe_install" {
+  # depends_on = [kubernetes_secret_v1.tfe_pull_secret, data.helm_template.tfe_install]
   depends_on = [kubernetes_secret_v1.tfe_pull_secret]
 
   name             = "terraform-enterprise"
@@ -274,11 +338,58 @@ resource "helm_release" "tfe_install" {
 
   set_sensitive = local.set_sensitive_values_list_final
 
-  values = [<<-EOF
-    container:
-      securityContext:
-        runAsUser: 1000
-  EOF
+  values = [
+    yamlencode({
+      "config" = {
+        "annotations" = {}
+      }
+      "env" = {
+        "variables" = {
+          "TFE_RUN_PIPELINE_KUBERNETES_OPEN_SHIFT_ENABLED" = "true"
+        }
+      }
+      "agents" = {
+        "namespace" = {
+          "enabled" = false
+        },
+        "rbac" = local.tfe_agents_rbac
+      }
+      "deployment" = {
+        "labels"      = local.tfe_deployment_labels,
+        "annotations" = local.tfe_deployment_annotations
+      },
+      "adminHttpsPort"  = null,
+      "tlsRedis"        = null,
+      "tlsRedisSidekiq" = null,
+      "container" = {
+        "command" = ["/bin/sh"],
+        "args"    = ["-c", "/scripts/custom_tfe_start.sh"],
+        "securityContext" = {
+          "runAsUser" = 1000
+        }
+      },
+      "extraVolumes" = [
+        {
+          "configMap" = {
+            "defaultMode" = 488
+            "name"        = "custom-tfe-start"
+          }
+          "name" = "scripts"
+        }
+      ],
+      "extraVolumeMounts" = [
+        {
+          "mountPath" = "/scripts"
+          "name"      = "scripts"
+          "readOnly"  = true
+        }
+      ]
+      "service"          = local.tfe_service_values,
+      "serviceSecondary" = local.tfe_service_secondary_values,
+      "serviceAccount"   = local.tfe_service_account,
+      "resources"        = local.tfe_resources_configuration,
+      "secret"           = local.tfe_secret,
+    }),
   ]
 }
 
@@ -462,7 +573,7 @@ resource "kubernetes_secret_v1" "tfe_admin_token" {
   }
   data = {
     token = (
-      data.external.admin_user_token.result["token"] != null && data.external.admin_user_token.result["token"] != ""
+      data.external.admin_user_token.result["token"] != null && data.external.admin_user_token.result["token"] != "" && data.external.admin_user_token.result["token"] != "-1"
       ? data.external.admin_user_token.result["token"]
       : (try(data.kubernetes_secret_v1.tfe_admin_token.data.token, ""))
     )
