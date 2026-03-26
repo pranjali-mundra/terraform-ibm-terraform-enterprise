@@ -56,7 +56,7 @@ locals {
 
 module "cos" {
   source                   = "terraform-ibm-modules/cos/ibm"
-  version                  = "10.14.8"
+  version                  = "10.14.9"
   resource_group_id        = var.resource_group_id
   region                   = var.region
   create_cos_instance      = var.existing_cos_instance_id != null ? false : true
@@ -66,7 +66,6 @@ module "cos" {
   bucket_name              = var.cos_bucket_name
   add_bucket_name_suffix   = true
   create_cos_bucket        = true
-  retention_enabled        = var.cos_retention # disable retention for test environments - enable for stage/prod
   kms_encryption_enabled   = true
   kms_key_crn              = module.key_protect_all_inclusive.keys["terraform-enterprise.terraform-enterprise-cos"].crn
   resource_keys = [
@@ -105,7 +104,7 @@ module "ocp_vpc" {
 
 module "icd_postgres" {
   source                       = "terraform-ibm-modules/icd-postgresql/ibm"
-  version                      = "4.10.13"
+  version                      = "4.11.0"
   resource_group_id            = var.resource_group_id
   name                         = var.postgres_instance_name
   postgresql_version           = "16" # TFE supports up to Postgres 16 (not 17)
@@ -116,9 +115,12 @@ module "icd_postgres" {
   use_same_kms_key_for_backups = false
   kms_key_crn                  = module.key_protect_all_inclusive.keys["terraform-enterprise.terraform-enterprise-postgresql"].crn
   backup_encryption_key_crn    = module.key_protect_all_inclusive.keys["terraform-enterprise.terraform-enterprise-postgresql-backup"].crn
-  service_credential_names = {
-    "tfe" : "Operator"
-  }
+  service_credential_names = [
+    {
+      "name" : "tfe",
+      "role" : "Operator"
+    }
+  ]
   deletion_protection = var.postgres_deletion_protection
 }
 
@@ -224,7 +226,7 @@ module "icd_postgres_vpe" {
   depends_on = [time_sleep.wait_before_creating_vpe]
   count      = var.postgres_vpe_enabled ? 1 : 0
   source     = "terraform-ibm-modules/vpe-gateway/ibm"
-  version    = "5.0.7"
+  version    = "5.1.0"
   region     = var.region
   cloud_service_by_crn = [
     {
